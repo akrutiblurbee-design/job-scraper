@@ -14,7 +14,7 @@ from jobspy import scrape_jobs
 
 PAST_DAYS = 7
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 10
+RESULTS_WANTED = 50
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 OUTPUT_PATH = "output/jobs_ranked.csv"
