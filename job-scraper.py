@@ -1,10 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import json
+import os
 import re
 
 import pandas as pd
 from jobspy import scrape_jobs
 
+
+# ─── Config ───────────────────────────────────────────────────────────────────
 
 PAST_DAYS = 7
 HOURS_OLD = PAST_DAYS * 24
@@ -48,7 +54,6 @@ WEB_DEV_TERMS = [
     "mern stack developer",
     "frontend developer",
     "backend developer",
-
 ]
 
 AI_TERMS = [
@@ -67,6 +72,8 @@ MOBILE_TERMS = [
     "android developer",
 ]
 
+
+# ─── Core Logic ───────────────────────────────────────────────────────────────
 
 def calculate_rank_score(
     title,
@@ -104,7 +111,7 @@ def extract_work_location(description):
 
     desc = str(description).lower()
 
-    if re.search(r"\bremote\b", desc):  
+    if re.search(r"\bremote\b", desc):
         return "Remote"
     if re.search(r"\bhybrid\b", desc):
         return "Hybrid"
@@ -150,8 +157,6 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
     for df in all_frames:
         if df.empty:
             continue
-        # Skip frames whose columns are entirely missing so pandas does not
-        # warn about future dtype inference changes during concat.
         cleaned_df = df.dropna(axis=1, how="all")
         if cleaned_df.empty:
             continue
@@ -162,17 +167,13 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
         return pd.DataFrame()
 
     combined = pd.concat(valid_frames, ignore_index=True)
-
-    # Deduplicate by job URL
     combined.drop_duplicates(subset=["job_url"], inplace=True)
 
-    # Extract work location from description
     if "description" in combined.columns:
         combined["work_location"] = combined["description"].apply(extract_work_location)
     else:
         combined["work_location"] = "Unknown"
 
-    # Keep only jobs whose official date_posted is within the past week
     if "date_posted" in combined.columns:
         cutoff = datetime.now(timezone.utc) - timedelta(days=PAST_DAYS)
         combined["date_posted_parsed"] = pd.to_datetime(
@@ -209,7 +210,6 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
     print(f"  [{category_label}] {len(combined)} total -> {len(remote_only)} remote jobs kept.")
 
-    # Return essential fields
     cols = [
         "title",
         "company",
@@ -239,13 +239,16 @@ def save_csv(df: pd.DataFrame, filepath: str):
             f"{output_path.stem}_{timestamp}{output_path.suffix}"
         )
         df.to_csv(fallback_path, index=False, encoding="utf-8")
-        print(
-            f"  Could not write to {output_path} because it is open elsewhere. "
-            f"Saved {len(df)} jobs -> {fallback_path} instead."
-        )
+        print(f"  Saved {len(df)} jobs -> {fallback_path} (fallback)")
 
 
-if __name__ == "__main__":
+def run_scraper() -> list[dict]:
+    """
+    Run all scraping categories and return combined jobs as a list of dicts.
+    Also saves a local CSV as backup.
+    """
+    print(f"\n[{datetime.now()}] Starting scrape run...")
+
     print("\nScraping Web Dev jobs...")
     web_dev_jobs = scrape_category(WEB_DEV_TERMS, "Web Dev")
 
@@ -256,6 +259,7 @@ if __name__ == "__main__":
     mobile_jobs = scrape_category(MOBILE_TERMS, "Mobile")
 
     all_jobs = pd.concat([web_dev_jobs, ai_jobs, mobile_jobs], ignore_index=True)
+
     if not all_jobs.empty and "rank_score" in all_jobs.columns:
         all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
     if not all_jobs.empty and "job_url" in all_jobs.columns:
@@ -263,6 +267,7 @@ if __name__ == "__main__":
     if not all_jobs.empty and "rank_score" in all_jobs.columns:
         all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
 
+    # Save CSV backup locally
     save_csv(all_jobs, OUTPUT_PATH)
 
     print("\n-----------------------------")
@@ -271,3 +276,69 @@ if __name__ == "__main__":
     print(f"Mobile   : {len(mobile_jobs)} remote jobs")
     print(f"Combined : {len(all_jobs)} remote jobs")
     print("Done!")
+
+    # Convert to JSON-serializable list
+    # Replace NaN with None so json.dumps doesn't fail
+    all_jobs = all_jobs.where(pd.notnull(all_jobs), None)
+    return all_jobs.to_dict(orient="records")
+
+
+# ─── HTTP Server (for Railway / n8n trigger) ──────────────────────────────────
+
+class ScraperHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        """Health check endpoint — Railway uses this to verify the app is running."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "ok", "message": "Job scraper is running"}).encode())
+
+    def do_POST(self):
+        """
+        Trigger endpoint — n8n calls POST / to start a scrape.
+        Runs the scraper synchronously and returns JSON results.
+        """
+        print(f"\n[{datetime.now()}] POST /  — scrape triggered via HTTP")
+
+        try:
+            jobs = run_scraper()
+            response = {
+                "success": True,
+                "count": len(jobs),
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "jobs": jobs,
+            }
+            status = 200
+        except Exception as e:
+            print(f"  Scraper error: {e}")
+            response = {
+                "success": False,
+                "error": str(e),
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "jobs": [],
+            }
+            status = 500
+
+        body = json.dumps(response, default=str).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # Use print so logs appear in Railway dashboard
+        print(f"  [HTTP] {self.address_string()} - {format % args}")
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), ScraperHandler)
+    print(f"[{datetime.now()}] Job Scraper HTTP server started on port {port}")
+    print(f"  GET  /  → health check")
+    print(f"  POST /  → trigger scrape (returns JSON)")
+    server.serve_forever()
