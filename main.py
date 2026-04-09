@@ -6,7 +6,7 @@ import re
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse 
 from jobspy import scrape_jobs
 
 
