@@ -1,12 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-import json
+import io
 import os
 import re
 
 import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 from jobspy import scrape_jobs
 
 
@@ -226,7 +226,7 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
 
 def save_csv(df: pd.DataFrame, filepath: str):
-    """Save DataFrame to CSV."""
+    """Save DataFrame to CSV file on disk."""
     output_path = Path(filepath)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -242,10 +242,10 @@ def save_csv(df: pd.DataFrame, filepath: str):
         print(f"  Saved {len(df)} jobs -> {fallback_path} (fallback)")
 
 
-def run_scraper() -> list[dict]:
+def run_scraper() -> pd.DataFrame:
     """
-    Run all scraping categories and return combined jobs as a list of dicts.
-    Also saves a local CSV as backup.
+    Run all scraping categories and return a combined DataFrame.
+    Also saves a local CSV backup.
     """
     print(f"\n[{datetime.now()}] Starting scrape run...")
 
@@ -277,68 +277,103 @@ def run_scraper() -> list[dict]:
     print(f"Combined : {len(all_jobs)} remote jobs")
     print("Done!")
 
-    # Convert to JSON-serializable list
-    # Replace NaN with None so json.dumps doesn't fail
-    all_jobs = all_jobs.where(pd.notnull(all_jobs), None)
-    return all_jobs.to_dict(orient="records")
+    return all_jobs
 
 
-# ─── HTTP Server (for Railway / n8n trigger) ──────────────────────────────────
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
 
-class ScraperHandler(BaseHTTPRequestHandler):
+app = FastAPI(
+    title="Job Scraper API",
+    description="Scrapes LinkedIn remote jobs and returns ranked results.",
+    version="1.0.0",
+)
 
-    def do_GET(self):
-        """Health check endpoint — Railway uses this to verify the app is running."""
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "ok", "message": "Job scraper is running"}).encode())
 
-    def do_POST(self):
-        """
-        Trigger endpoint — n8n calls POST / to start a scrape.
-        Runs the scraper synchronously and returns JSON results.
-        """
-        print(f"\n[{datetime.now()}] POST /  — scrape triggered via HTTP")
+@app.get("/", summary="Health check")
+def health_check():
+    """Railway health check — confirms the app is running."""
+    return {"status": "ok", "message": "Job scraper is running"}
 
-        try:
-            jobs = run_scraper()
-            response = {
-                "success": True,
-                "count": len(jobs),
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "jobs": jobs,
-            }
-            status = 200
-        except Exception as e:
-            print(f"  Scraper error: {e}")
-            response = {
-                "success": False,
-                "error": str(e),
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "jobs": [],
-            }
-            status = 500
 
-        body = json.dumps(response, default=str).encode("utf-8")
+@app.post("/scrape", summary="Run scraper → return JSON")
+def scrape_json():
+    """
+    Trigger a full scrape run.
+    Returns all ranked remote jobs as a JSON array.
+    Ideal for n8n HTTP Request nodes or programmatic access.
+    """
+    try:
+        df = run_scraper()
+        # Replace NaN with None so JSON serialisation works cleanly
+        df = df.where(pd.notnull(df), None)
+        jobs = df.to_dict(orient="records")
+        return JSONResponse(content={
+            "success": True,
+            "count": len(jobs),
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "jobs": jobs,
+        })
+    except Exception as e:
+        print(f"  Scraper error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    def log_message(self, format, *args):
-        # Use print so logs appear in Railway dashboard
-        print(f"  [HTTP] {self.address_string()} - {format % args}")
+@app.get("/scrape/csv", summary="Run scraper → download CSV")
+def scrape_csv():
+    """
+    Trigger a full scrape run and return the results as a downloadable CSV file.
+    The response has Content-Disposition: attachment so browsers/n8n download it directly.
+    Perfect for the n8n HTTP Request node with Response Format = File.
+    """
+    try:
+        df = run_scraper()
+
+        # Write CSV to an in-memory buffer — no temp file needed
+        buffer = io.StringIO()
+        df.to_csv(buffer, index=False, encoding="utf-8")
+        buffer.seek(0)
+
+        filename = f"jobs_ranked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        return StreamingResponse(
+            iter([buffer.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        print(f"  Scraper error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/scrape/csv/cached", summary="Return last saved CSV (no re-scrape)")
+def scrape_csv_cached():
+    """
+    Return the most recently saved CSV from disk without triggering a new scrape.
+    Fast — useful if you want to fetch the same file multiple times without
+    hammering LinkedIn again.
+    """
+    output_path = Path(OUTPUT_PATH)
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No cached CSV found. Run POST /scrape or GET /scrape/csv first.",
+        )
+
+    def iterfile():
+        with open(output_path, "r", encoding="utf-8") as f:
+            yield from f
+
+    filename = output_path.name
+    return StreamingResponse(
+        iterfile(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), ScraperHandler)
-    print(f"[{datetime.now()}] Job Scraper HTTP server started on port {port}")
-    print(f"  GET  /  → health check")
-    print(f"  POST /  → trigger scrape (returns JSON)")
-    server.serve_forever()
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
