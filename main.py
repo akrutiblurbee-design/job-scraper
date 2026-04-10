@@ -368,7 +368,7 @@ async def lifespan(app: FastAPI):
         run_scraper,
         trigger="cron",
         hour=12,
-        minute=40,
+        minute=47,
         id="daily_scrape",
         replace_existing=True,
     )
