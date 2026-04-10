@@ -4,5 +4,5 @@ pandas
 python-dateutil
 python-jobspy
 linkedin_api
-boto3
+supabase
 apscheduler
