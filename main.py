@@ -1,12 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from contextlib import asynccontextmanager
 import io
 import os
 import re
 
+import boto3
+from botocore.config import Config
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse 
+from fastapi.responses import JSONResponse, StreamingResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from jobspy import scrape_jobs
 
 
@@ -17,9 +21,28 @@ HOURS_OLD = PAST_DAYS * 24
 RESULTS_WANTED = 50
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
-OUTPUT_PATH = "output/jobs_ranked.csv"
 INCLUDE_RANK_SCORE = True
 MAX_RANK_SCORE = 10
+
+# ─── Supabase S3 Config ───────────────────────────────────────────────────────
+
+SUPABASE_S3_ENDPOINT = "https://gezjisnnazcomxdsybxr.storage.supabase.co/storage/v1/s3"
+SUPABASE_BUCKET = "Job-scraper"
+S3_PREFIX = "jobs/"
+FILE_RETENTION_DAYS = 3
+
+# Set these in your Railway environment variables
+AWS_ACCESS_KEY_ID = os.environ.get("SUPABASE_S3_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.environ.get("SUPABASE_S3_SECRET_KEY")
+
+s3_client = boto3.client(
+    "s3",
+    endpoint_url=SUPABASE_S3_ENDPOINT,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="ap-south-1",  # Supabase requires a region value
+)
 
 RANK_KEYWORDS = {
     "python": 4,
@@ -73,6 +96,80 @@ MOBILE_TERMS = [
 ]
 
 
+# ─── Supabase S3 Helpers ──────────────────────────────────────────────────────
+
+def save_csv_to_supabase(df: pd.DataFrame):
+    """
+    Save CSV to Supabase S3 bucket.
+    - Saves dated archive:  jobs/2026-04-10_jobs.csv
+    - Overwrites pointer:   jobs/latest.csv
+    """
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False, encoding="utf-8")
+    csv_bytes = buffer.getvalue().encode("utf-8")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    dated_key = f"{S3_PREFIX}{today}_jobs.csv"
+
+    # Dated archive
+    s3_client.put_object(
+        Bucket=SUPABASE_BUCKET,
+        Key=dated_key,
+        Body=csv_bytes,
+        ContentType="text/csv",
+    )
+    print(f"  Saved archive -> {dated_key}")
+
+    # Latest pointer — always overwritten
+    s3_client.put_object(
+        Bucket=SUPABASE_BUCKET,
+        Key=f"{S3_PREFIX}latest.csv",
+        Body=csv_bytes,
+        ContentType="text/csv",
+    )
+    print(f"  Updated pointer -> {S3_PREFIX}latest.csv")
+
+
+def read_latest_csv_from_supabase() -> pd.DataFrame:
+    """Read jobs/latest.csv from Supabase S3."""
+    obj = s3_client.get_object(
+        Bucket=SUPABASE_BUCKET,
+        Key=f"{S3_PREFIX}latest.csv",
+    )
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+
+def delete_old_files_from_supabase():
+    """
+    Delete dated CSV files older than FILE_RETENTION_DAYS.
+    Never deletes latest.csv.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FILE_RETENTION_DAYS)
+
+    response = s3_client.list_objects_v2(
+        Bucket=SUPABASE_BUCKET,
+        Prefix=S3_PREFIX,
+    )
+
+    deleted_count = 0
+    for obj in response.get("Contents", []):
+        key = obj["Key"]
+
+        if key == f"{S3_PREFIX}latest.csv":
+            continue
+
+        last_modified = obj["LastModified"]
+        if last_modified.tzinfo is None:
+            last_modified = last_modified.replace(tzinfo=timezone.utc)
+
+        if last_modified < cutoff:
+            s3_client.delete_object(Bucket=SUPABASE_BUCKET, Key=key)
+            print(f"  Deleted old file: {key}")
+            deleted_count += 1
+
+    print(f"  Cleanup done: {deleted_count} old file(s) deleted.")
+
+
 # ─── Core Logic ───────────────────────────────────────────────────────────────
 
 def calculate_rank_score(
@@ -122,11 +219,6 @@ def extract_work_location(description):
 
 
 def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFrame:
-    """
-    Scrape LinkedIn for each search term and each job type,
-    combine results, deduplicate, keep only past-week postings,
-    and keep remote only.
-    """
     all_frames = []
 
     for term in search_terms:
@@ -210,13 +302,7 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
     print(f"  [{category_label}] {len(combined)} total -> {len(remote_only)} remote jobs kept.")
 
-    cols = [
-        "title",
-        "company",
-        "job_url",
-        "work_location",
-        "queried_job_type",
-    ]
+    cols = ["title", "company", "job_url", "work_location", "queried_job_type"]
     if INCLUDE_RANK_SCORE:
         cols.append("rank_score")
     available = [c for c in cols if c in remote_only.columns]
@@ -225,27 +311,9 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
     return result
 
 
-def save_csv(df: pd.DataFrame, filepath: str):
-    """Save DataFrame to CSV file on disk."""
-    output_path = Path(filepath)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        df.to_csv(output_path, index=False, encoding="utf-8")
-        print(f"  Saved {len(df)} jobs -> {output_path}")
-    except PermissionError:
-        timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
-        fallback_path = output_path.with_name(
-            f"{output_path.stem}_{timestamp}{output_path.suffix}"
-        )
-        df.to_csv(fallback_path, index=False, encoding="utf-8")
-        print(f"  Saved {len(df)} jobs -> {fallback_path} (fallback)")
-
-
 def run_scraper() -> pd.DataFrame:
     """
-    Run all scraping categories and return a combined DataFrame.
-    Also saves a local CSV backup.
+    Run all scraping categories, save to Supabase S3, clean up old files.
     """
     print(f"\n[{datetime.now()}] Starting scrape run...")
 
@@ -267,8 +335,11 @@ def run_scraper() -> pd.DataFrame:
     if not all_jobs.empty and "rank_score" in all_jobs.columns:
         all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
 
-    # Save CSV backup locally
-    save_csv(all_jobs, OUTPUT_PATH)
+    print("\nSaving to Supabase S3...")
+    save_csv_to_supabase(all_jobs)
+
+    print("\nCleaning up old files (>3 days)...")
+    delete_old_files_from_supabase()
 
     print("\n-----------------------------")
     print(f"Web Dev  : {len(web_dev_jobs)} remote jobs")
@@ -280,31 +351,61 @@ def run_scraper() -> pd.DataFrame:
     return all_jobs
 
 
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+
+scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Start APScheduler when app boots.
+    Scrape runs at 8:00 AM IST daily — n8n triggers at 8:45 AM IST.
+    """
+    scheduler.add_job(
+        run_scraper,
+        trigger="cron",
+        hour=8,
+        minute=0,
+        id="daily_scrape",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print("[Scheduler] Started. Daily scrape at 8:00 AM IST.")
+    yield
+    scheduler.shutdown()
+    print("[Scheduler] Shut down.")
+
+
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 
 @app.get("/", summary="Health check")
 def health_check():
-    """Railway health check — confirms the app is running."""
-    return {"status": "ok", "message": "Job scraper is running"}
+    """Health check — also shows next scheduled scrape time."""
+    next_run = None
+    job = scheduler.get_job("daily_scrape")
+    if job and job.next_run_time:
+        next_run = job.next_run_time.isoformat()
+    return {
+        "status": "ok",
+        "message": "Job scraper is running",
+        "next_scheduled_scrape_IST": next_run,
+    }
 
 
-@app.post("/scrape", summary="Run scraper → return JSON")
+@app.post("/scrape", summary="Manually trigger scraper → return JSON")
 def scrape_json():
-    """
-    Trigger a full scrape run.
-    Returns all ranked remote jobs as a JSON array.
-    Ideal for n8n HTTP Request nodes or programmatic access.
-    """
+    """Manually trigger a full scrape. Saves to Supabase S3 and cleans old files."""
     try:
         df = run_scraper()
-        # Replace NaN with None so JSON serialisation works cleanly
         df = df.where(pd.notnull(df), None)
         jobs = df.to_dict(orient="records")
         return JSONResponse(content={
@@ -318,23 +419,18 @@ def scrape_json():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/scrape/csv", summary="Run scraper → download CSV")
+@app.get("/scrape/csv", summary="Manually trigger scraper → download CSV")
 def scrape_csv():
     """
-    Trigger a full scrape run and return the results as a downloadable CSV file.
-    The response has Content-Disposition: attachment so browsers/n8n download it directly.
-    Perfect for the n8n HTTP Request node with Response Format = File.
+    Manually trigger a full scrape and return as downloadable CSV.
+    WARNING: Takes ~15 min. Use /scrape/csv/cached for n8n.
     """
     try:
         df = run_scraper()
-
-        # Write CSV to an in-memory buffer — no temp file needed
         buffer = io.StringIO()
         df.to_csv(buffer, index=False, encoding="utf-8")
         buffer.seek(0)
-
         filename = f"jobs_ranked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
         return StreamingResponse(
             iter([buffer.getvalue()]),
             media_type="text/csv",
@@ -345,30 +441,55 @@ def scrape_csv():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/scrape/csv/cached", summary="Return last saved CSV (no re-scrape)")
+@app.get("/scrape/csv/cached", summary="← USE THIS IN n8n — returns latest CSV instantly")
 def scrape_csv_cached():
     """
-    Return the most recently saved CSV from disk without triggering a new scrape.
-    Fast — useful if you want to fetch the same file multiple times without
-    hammering LinkedIn again.
+    Returns jobs/latest.csv from Supabase S3. Responds in milliseconds.
+    The scheduler pre-populates this every day at 8:00 AM IST.
+    Set your n8n trigger to 8:45 AM IST.
     """
-    output_path = Path(OUTPUT_PATH)
-    if not output_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="No cached CSV found. Run POST /scrape or GET /scrape/csv first.",
-        )
+    try:
+        df = read_latest_csv_from_supabase()
+    except Exception as e:
+        error_msg = str(e)
+        if "NoSuchKey" in error_msg or "404" in error_msg:
+            raise HTTPException(
+                status_code=404,
+                detail="No cached CSV found yet. Scheduler runs at 8:00 AM IST. "
+                       "Or trigger manually via POST /scrape.",
+            )
+        raise HTTPException(status_code=500, detail=f"S3 read error: {error_msg}")
 
-    def iterfile():
-        with open(output_path, "r", encoding="utf-8") as f:
-            yield from f
-
-    filename = output_path.name
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False, encoding="utf-8")
+    buffer.seek(0)
+    filename = f"jobs_ranked_{datetime.now().strftime('%Y%m%d')}.csv"
     return StreamingResponse(
-        iterfile(),
+        iter([buffer.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+@app.get("/scrape/csv/list", summary="List all CSV files stored in Supabase S3")
+def list_csv_files():
+    """List all files in the bucket — useful for debugging retention cleanup."""
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=SUPABASE_BUCKET,
+            Prefix=S3_PREFIX,
+        )
+        files = [
+            {
+                "key": obj["Key"],
+                "last_modified": obj["LastModified"].isoformat(),
+                "size_kb": round(obj["Size"] / 1024, 2),
+            }
+            for obj in response.get("Contents", [])
+        ]
+        return JSONResponse(content={"count": len(files), "files": files})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
