@@ -94,11 +94,6 @@ MOBILE_TERMS = [
 import httpx
 
 def save_csv_to_supabase(df: pd.DataFrame):
-    """
-    Save CSV to Supabase Storage using the official Python client.
-    - Saves dated archive:  jobs/2026-04-10_jobs.csv
-    - Overwrites pointer:   jobs/latest.csv
-    """
     buffer = io.StringIO()
     df.to_csv(buffer, index=False, encoding="utf-8")
     csv_bytes = buffer.getvalue().encode("utf-8")
@@ -109,26 +104,30 @@ def save_csv_to_supabase(df: pd.DataFrame):
         f"{S3_PREFIX}/latest.csv",
     ]
 
+    base_url = SUPABASE_URL.rstrip("/")  # strip any trailing slash
+    bucket = SUPABASE_BUCKET             # "Job-scraper"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "text/csv",
+        "x-upsert": "true",
+    }
+
     for path in paths:
-        try:
-            # Try update first (file exists)
-            supabase.storage.from_(SUPABASE_BUCKET).update(
-                path,
-                csv_bytes,
-                {"content-type": "text/csv", "upsert": "true"},
+        url = f"{base_url}/storage/v1/object/{bucket}/{path}"
+        print(f"  Uploading to: {url}")  # ← lets you verify the URL in Railway logs
+
+        with httpx.Client() as client:
+            response = client.post(url, content=csv_bytes, headers=headers, timeout=30)
+
+        print(f"  Response: HTTP {response.status_code} — {response.text[:200]}")
+
+        if response.status_code not in (200, 201):
+            raise Exception(
+                f"Failed to upload {path}: HTTP {response.status_code} — {response.text}"
             )
-            print(f"  Updated -> {path}")
-        except Exception:
-            try:
-                # Fall back to upload (file doesn't exist yet)
-                supabase.storage.from_(SUPABASE_BUCKET).upload(
-                    path,
-                    csv_bytes,
-                    {"content-type": "text/csv"},
-                )
-                print(f"  Uploaded -> {path}")
-            except Exception as e:
-                raise Exception(f"Failed to save {path}: {e}")
+        print(f"  Saved -> {path}")
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
     """Download jobs/latest.csv from Supabase Storage."""
