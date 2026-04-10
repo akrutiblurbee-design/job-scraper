@@ -105,21 +105,27 @@ def save_csv_to_supabase(df: pd.DataFrame):
     dated_path = f"{S3_PREFIX}/{today}_jobs.csv"
     latest_path = f"{S3_PREFIX}/latest.csv"
 
-    # Save dated archive (upsert in case same day re-run)
-    supabase.storage.from_(SUPABASE_BUCKET).upload(
-        path=dated_path,
-        file=csv_bytes,
-        file_options={"content-type": "text/csv", "upsert": "true"},
-    )
-    print(f"  Saved archive -> {dated_path}")
-
-    # Overwrite latest pointer
-    supabase.storage.from_(SUPABASE_BUCKET).upload(
-        path=latest_path,
-        file=csv_bytes,
-        file_options={"content-type": "text/csv", "upsert": "true"},
-    )
-    print(f"  Updated pointer -> {latest_path}")
+    for path, data in [(dated_path, csv_bytes), (latest_path, csv_bytes)]:
+        try:
+            # Try upload first
+            supabase.storage.from_(SUPABASE_BUCKET).upload(
+                path=path,
+                file=data,
+                file_options={"content-type": "text/csv"},
+            )
+            print(f"  Uploaded -> {path}")
+        except Exception as upload_err:
+            # If file already exists, use update instead
+            try:
+                supabase.storage.from_(SUPABASE_BUCKET).update(
+                    path=path,
+                    file=data,
+                    file_options={"content-type": "text/csv"},
+                )
+                print(f"  Updated -> {path}")
+            except Exception as update_err:
+                print(f"  ERROR saving {path}: {update_err}")
+                raise
 
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
