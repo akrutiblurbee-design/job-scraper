@@ -16,7 +16,7 @@ from jobspy import scrape_jobs
 
 PAST_DAYS = 2
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 100
+RESULTS_WANTED = 10
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
