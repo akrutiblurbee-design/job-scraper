@@ -1,16 +1,14 @@
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from contextlib import asynccontextmanager
 import io
 import os
 import re
 
-import boto3
-from botocore.config import Config
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from supabase import create_client, Client
 from jobspy import scrape_jobs
 
 
@@ -24,25 +22,20 @@ JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
 MAX_RANK_SCORE = 10
 
-# ─── Supabase S3 Config ───────────────────────────────────────────────────────
+# ─── Supabase Config ──────────────────────────────────────────────────────────
 
-SUPABASE_S3_ENDPOINT = "https://gezjisnnazcomxdsybxr.storage.supabase.co/storage/v1/s3"
-SUPABASE_BUCKET = "Job-scraper"
-S3_PREFIX = "jobs/"
+# Set these in your Railway environment variables:
+#   SUPABASE_URL         = https://gezjisnnazcomxdsybxr.supabase.co
+#   SUPABASE_SERVICE_KEY = eyJ... (service_role key from Project Settings → API)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+SUPABASE_BUCKET = "Job-scraper"   # must match exactly (case-sensitive) in dashboard
+S3_PREFIX = "jobs"                # folder name inside the bucket — no trailing slash
 FILE_RETENTION_DAYS = 3
 
-# Set these in your Railway environment variables
-AWS_ACCESS_KEY_ID = os.environ.get("SUPABASE_S3_ACCESS_KEY")
-AWS_SECRET_ACCESS_KEY = os.environ.get("SUPABASE_S3_SECRET_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=SUPABASE_S3_ENDPOINT,
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    config=Config(signature_version="s3v4"),
-    region_name="ap-south-1",  # Supabase requires a region value
-)
+# ─── Keywords & Search Terms ──────────────────────────────────────────────────
 
 RANK_KEYWORDS = {
     "python": 4,
@@ -96,11 +89,11 @@ MOBILE_TERMS = [
 ]
 
 
-# ─── Supabase S3 Helpers ──────────────────────────────────────────────────────
+# ─── Supabase Storage Helpers ─────────────────────────────────────────────────
 
 def save_csv_to_supabase(df: pd.DataFrame):
     """
-    Save CSV to Supabase S3 bucket.
+    Save CSV to Supabase Storage bucket.
     - Saves dated archive:  jobs/2026-04-10_jobs.csv
     - Overwrites pointer:   jobs/latest.csv
     """
@@ -109,34 +102,32 @@ def save_csv_to_supabase(df: pd.DataFrame):
     csv_bytes = buffer.getvalue().encode("utf-8")
 
     today = datetime.now().strftime("%Y-%m-%d")
-    dated_key = f"{S3_PREFIX}{today}_jobs.csv"
+    dated_path = f"{S3_PREFIX}/{today}_jobs.csv"
+    latest_path = f"{S3_PREFIX}/latest.csv"
 
-    # Dated archive
-    s3_client.put_object(
-        Bucket=SUPABASE_BUCKET,
-        Key=dated_key,
-        Body=csv_bytes,
-        ContentType="text/csv",
+    # Save dated archive (upsert in case same day re-run)
+    supabase.storage.from_(SUPABASE_BUCKET).upload(
+        path=dated_path,
+        file=csv_bytes,
+        file_options={"content-type": "text/csv", "upsert": "true"},
     )
-    print(f"  Saved archive -> {dated_key}")
+    print(f"  Saved archive -> {dated_path}")
 
-    # Latest pointer — always overwritten
-    s3_client.put_object(
-        Bucket=SUPABASE_BUCKET,
-        Key=f"{S3_PREFIX}latest.csv",
-        Body=csv_bytes,
-        ContentType="text/csv",
+    # Overwrite latest pointer
+    supabase.storage.from_(SUPABASE_BUCKET).upload(
+        path=latest_path,
+        file=csv_bytes,
+        file_options={"content-type": "text/csv", "upsert": "true"},
     )
-    print(f"  Updated pointer -> {S3_PREFIX}latest.csv")
+    print(f"  Updated pointer -> {latest_path}")
 
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
-    """Read jobs/latest.csv from Supabase S3."""
-    obj = s3_client.get_object(
-        Bucket=SUPABASE_BUCKET,
-        Key=f"{S3_PREFIX}latest.csv",
+    """Download jobs/latest.csv from Supabase Storage."""
+    response = supabase.storage.from_(SUPABASE_BUCKET).download(
+        f"{S3_PREFIX}/latest.csv"
     )
-    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+    return pd.read_csv(io.BytesIO(response))
 
 
 def delete_old_files_from_supabase():
@@ -146,28 +137,31 @@ def delete_old_files_from_supabase():
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=FILE_RETENTION_DAYS)
 
-    response = s3_client.list_objects_v2(
-        Bucket=SUPABASE_BUCKET,
-        Prefix=S3_PREFIX,
-    )
+    # List all files inside the jobs/ folder
+    files = supabase.storage.from_(SUPABASE_BUCKET).list(S3_PREFIX)
 
-    deleted_count = 0
-    for obj in response.get("Contents", []):
-        key = obj["Key"]
-
-        if key == f"{S3_PREFIX}latest.csv":
+    to_delete = []
+    for f in files:
+        if f["name"] == "latest.csv":
             continue
 
-        last_modified = obj["LastModified"]
-        if last_modified.tzinfo is None:
-            last_modified = last_modified.replace(tzinfo=timezone.utc)
+        # updated_at format: "2026-04-10T08:00:00.000Z"
+        updated_at_str = f.get("updated_at") or f.get("created_at", "")
+        try:
+            last_modified = datetime.fromisoformat(
+                updated_at_str.replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            continue
 
         if last_modified < cutoff:
-            s3_client.delete_object(Bucket=SUPABASE_BUCKET, Key=key)
-            print(f"  Deleted old file: {key}")
-            deleted_count += 1
+            to_delete.append(f"{S3_PREFIX}/{f['name']}")
 
-    print(f"  Cleanup done: {deleted_count} old file(s) deleted.")
+    if to_delete:
+        supabase.storage.from_(SUPABASE_BUCKET).remove(to_delete)
+        print(f"  Deleted {len(to_delete)} old file(s): {to_delete}")
+    else:
+        print("  No old files to delete.")
 
 
 # ─── Core Logic ───────────────────────────────────────────────────────────────
@@ -313,7 +307,7 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
 def run_scraper() -> pd.DataFrame:
     """
-    Run all scraping categories, save to Supabase S3, clean up old files.
+    Run all scraping categories, save to Supabase Storage, clean up old files.
     """
     print(f"\n[{datetime.now()}] Starting scrape run...")
 
@@ -335,7 +329,7 @@ def run_scraper() -> pd.DataFrame:
     if not all_jobs.empty and "rank_score" in all_jobs.columns:
         all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
 
-    print("\nSaving to Supabase S3...")
+    print("\nSaving to Supabase Storage...")
     save_csv_to_supabase(all_jobs)
 
     print("\nCleaning up old files (>3 days)...")
@@ -365,13 +359,13 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         run_scraper,
         trigger="cron",
-        hour=10,
-        minute=25,
+        hour=8,
+        minute=0,
         id="daily_scrape",
         replace_existing=True,
     )
     scheduler.start()
-    print("[Scheduler] Started. Daily scrape at 8:00 AM IST.")
+    print("[Scheduler] Started. Daily scrape scheduled at 8:00 AM IST.")
     yield
     scheduler.shutdown()
     print("[Scheduler] Shut down.")
@@ -382,7 +376,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -403,7 +397,7 @@ def health_check():
 
 @app.post("/scrape", summary="Manually trigger scraper → return JSON")
 def scrape_json():
-    """Manually trigger a full scrape. Saves to Supabase S3 and cleans old files."""
+    """Manually trigger a full scrape. Saves to Supabase Storage and cleans old files."""
     try:
         df = run_scraper()
         df = df.where(pd.notnull(df), None)
@@ -444,21 +438,21 @@ def scrape_csv():
 @app.get("/scrape/csv/cached", summary="← USE THIS IN n8n — returns latest CSV instantly")
 def scrape_csv_cached():
     """
-    Returns jobs/latest.csv from Supabase S3. Responds in milliseconds.
-    The scheduler pre-populates this every day at 8:00 AM IST.
+    Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
+    Pre-populated every day at 8:00 AM IST by the scheduler.
     Set your n8n trigger to 8:45 AM IST.
     """
     try:
         df = read_latest_csv_from_supabase()
     except Exception as e:
         error_msg = str(e)
-        if "NoSuchKey" in error_msg or "404" in error_msg:
+        if "not found" in error_msg.lower() or "404" in error_msg:
             raise HTTPException(
                 status_code=404,
                 detail="No cached CSV found yet. Scheduler runs at 8:00 AM IST. "
                        "Or trigger manually via POST /scrape.",
             )
-        raise HTTPException(status_code=500, detail=f"S3 read error: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Storage read error: {error_msg}")
 
     buffer = io.StringIO()
     df.to_csv(buffer, index=False, encoding="utf-8")
@@ -471,23 +465,23 @@ def scrape_csv_cached():
     )
 
 
-@app.get("/scrape/csv/list", summary="List all CSV files stored in Supabase S3")
+@app.get("/scrape/csv/list", summary="List all CSV files in Supabase Storage")
 def list_csv_files():
-    """List all files in the bucket — useful for debugging retention cleanup."""
+    """List all files in the jobs/ folder — useful for debugging retention cleanup."""
     try:
-        response = s3_client.list_objects_v2(
-            Bucket=SUPABASE_BUCKET,
-            Prefix=S3_PREFIX,
-        )
-        files = [
-            {
-                "key": obj["Key"],
-                "last_modified": obj["LastModified"].isoformat(),
-                "size_kb": round(obj["Size"] / 1024, 2),
-            }
-            for obj in response.get("Contents", [])
-        ]
-        return JSONResponse(content={"count": len(files), "files": files})
+        files = supabase.storage.from_(SUPABASE_BUCKET).list(S3_PREFIX)
+        return JSONResponse(content={
+            "count": len(files),
+            "files": [
+                {
+                    "name": f["name"],
+                    "updated_at": f.get("updated_at"),
+                    "size_kb": round(f["metadata"]["size"] / 1024, 2)
+                    if f.get("metadata") else None,
+                }
+                for f in files
+            ],
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
