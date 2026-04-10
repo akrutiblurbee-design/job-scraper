@@ -16,7 +16,7 @@ from jobspy import scrape_jobs
 
 PAST_DAYS = 2
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 10
+RESULTS_WANTED = 5
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -111,10 +111,11 @@ def save_csv_to_supabase(df: pd.DataFrame):
     ]
 
     headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "text/csv",
-        "x-upsert": "true",   # tells Supabase to insert OR replace
-    }
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,          # ← add this line
+    "Content-Type": "text/csv",
+    "x-upsert": "true",
+}
 
     for path in paths:
         url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
@@ -367,7 +368,7 @@ async def lifespan(app: FastAPI):
         run_scraper,
         trigger="cron",
         hour=12,
-        minute=20,
+        minute=40,
         id="daily_scrape",
         replace_existing=True,
     )
