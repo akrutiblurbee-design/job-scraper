@@ -91,9 +91,12 @@ MOBILE_TERMS = [
 
 # ─── Supabase Storage Helpers ─────────────────────────────────────────────────
 
+import httpx
+
 def save_csv_to_supabase(df: pd.DataFrame):
     """
-    Save CSV to Supabase Storage bucket.
+    Save CSV to Supabase Storage using direct HTTP calls.
+    Bypasses the broken Supabase Python client upload/update response parsing.
     - Saves dated archive:  jobs/2026-04-10_jobs.csv
     - Overwrites pointer:   jobs/latest.csv
     """
@@ -102,30 +105,28 @@ def save_csv_to_supabase(df: pd.DataFrame):
     csv_bytes = buffer.getvalue().encode("utf-8")
 
     today = datetime.now().strftime("%Y-%m-%d")
-    dated_path = f"{S3_PREFIX}/{today}_jobs.csv"
-    latest_path = f"{S3_PREFIX}/latest.csv"
+    paths = [
+        f"{S3_PREFIX}/{today}_jobs.csv",
+        f"{S3_PREFIX}/latest.csv",
+    ]
 
-    for path, data in [(dated_path, csv_bytes), (latest_path, csv_bytes)]:
-        try:
-            # Try upload first
-            supabase.storage.from_(SUPABASE_BUCKET).upload(
-                path=path,
-                file=data,
-                file_options={"content-type": "text/csv"},
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "text/csv",
+        "x-upsert": "true",   # tells Supabase to insert OR replace
+    }
+
+    for path in paths:
+        url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+        response = httpx.post(url, content=csv_bytes, headers=headers)
+
+        if response.status_code in (200, 201):
+            print(f"  Saved -> {path}")
+        else:
+            raise Exception(
+                f"Failed to upload {path}: "
+                f"HTTP {response.status_code} — {response.text}"
             )
-            print(f"  Uploaded -> {path}")
-        except Exception as upload_err:
-            # If file already exists, use update instead
-            try:
-                supabase.storage.from_(SUPABASE_BUCKET).update(
-                    path=path,
-                    file=data,
-                    file_options={"content-type": "text/csv"},
-                )
-                print(f"  Updated -> {path}")
-            except Exception as update_err:
-                print(f"  ERROR saving {path}: {update_err}")
-                raise
 
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
