@@ -95,8 +95,7 @@ import httpx
 
 def save_csv_to_supabase(df: pd.DataFrame):
     """
-    Save CSV to Supabase Storage using direct HTTP calls.
-    Bypasses the broken Supabase Python client upload/update response parsing.
+    Save CSV to Supabase Storage using the official Python client.
     - Saves dated archive:  jobs/2026-04-10_jobs.csv
     - Overwrites pointer:   jobs/latest.csv
     """
@@ -110,25 +109,26 @@ def save_csv_to_supabase(df: pd.DataFrame):
         f"{S3_PREFIX}/latest.csv",
     ]
 
-    headers = {
-    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    "apikey": SUPABASE_SERVICE_KEY,          # ← add this line
-    "Content-Type": "text/csv",
-    "x-upsert": "true",
-}
-
     for path in paths:
-        url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
-        response = httpx.post(url, content=csv_bytes, headers=headers)
-
-        if response.status_code in (200, 201):
-            print(f"  Saved -> {path}")
-        else:
-            raise Exception(
-                f"Failed to upload {path}: "
-                f"HTTP {response.status_code} — {response.text}"
+        try:
+            # Try update first (file exists)
+            supabase.storage.from_(SUPABASE_BUCKET).update(
+                path,
+                csv_bytes,
+                {"content-type": "text/csv", "upsert": "true"},
             )
-
+            print(f"  Updated -> {path}")
+        except Exception:
+            try:
+                # Fall back to upload (file doesn't exist yet)
+                supabase.storage.from_(SUPABASE_BUCKET).upload(
+                    path,
+                    csv_bytes,
+                    {"content-type": "text/csv"},
+                )
+                print(f"  Uploaded -> {path}")
+            except Exception as e:
+                raise Exception(f"Failed to save {path}: {e}")
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
     """Download jobs/latest.csv from Supabase Storage."""
