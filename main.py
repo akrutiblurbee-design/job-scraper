@@ -281,6 +281,11 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
     remote_only = combined[combined["work_location"] == "Remote"].copy()
 
+   # AFTER
+if remote_only.empty:
+    remote_only["rank_score"] = pd.Series(dtype=int)
+    remote_only["matched_keywords"] = pd.Series(dtype=str)
+else:
     remote_only[["rank_score", "matched_keywords"]] = remote_only.apply(
         lambda row: pd.Series(
             calculate_rank_score(
