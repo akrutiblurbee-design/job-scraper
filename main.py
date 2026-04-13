@@ -24,9 +24,6 @@ MAX_RANK_SCORE = 10
 
 # ─── Supabase Config ──────────────────────────────────────────────────────────
 
-# Set these in your Railway environment variables:
-#   SUPABASE_URL         = https://gezjisnnazcomxdsybxr.supabase.co
-#   SUPABASE_SERVICE_KEY = eyJ... (service_role key from Project Settings → API)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 SUPABASE_BUCKET = "Job-scraper"   # must match exactly (case-sensitive) in dashboard
@@ -104,8 +101,8 @@ def save_csv_to_supabase(df: pd.DataFrame):
         f"{S3_PREFIX}/latest.csv",
     ]
 
-    base_url = SUPABASE_URL.rstrip("/")  # strip any trailing slash
-    bucket = SUPABASE_BUCKET             # "Job-scraper"
+    base_url = SUPABASE_URL.rstrip("/")
+    bucket = SUPABASE_BUCKET
 
     headers = {
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -116,7 +113,7 @@ def save_csv_to_supabase(df: pd.DataFrame):
 
     for path in paths:
         url = f"{base_url}/storage/v1/object/{bucket}/{path}"
-        print(f"  Uploading to: {url}")  # ← lets you verify the URL in Railway logs
+        print(f"  Uploading to: {url}")
 
         with httpx.Client() as client:
             response = client.post(url, content=csv_bytes, headers=headers, timeout=30)
@@ -128,6 +125,7 @@ def save_csv_to_supabase(df: pd.DataFrame):
                 f"Failed to upload {path}: HTTP {response.status_code} — {response.text}"
             )
         print(f"  Saved -> {path}")
+
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
     """Download jobs/latest.csv from Supabase Storage."""
@@ -144,7 +142,6 @@ def delete_old_files_from_supabase():
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=FILE_RETENTION_DAYS)
 
-    # List all files inside the jobs/ folder
     files = supabase.storage.from_(SUPABASE_BUCKET).list(S3_PREFIX)
 
     to_delete = []
@@ -152,7 +149,6 @@ def delete_old_files_from_supabase():
         if f["name"] == "latest.csv":
             continue
 
-        # updated_at format: "2026-04-10T08:00:00.000Z"
         updated_at_str = f.get("updated_at") or f.get("created_at", "")
         try:
             last_modified = datetime.fromisoformat(
@@ -281,22 +277,23 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
     remote_only = combined[combined["work_location"] == "Remote"].copy()
 
-   # AFTER
-if remote_only.empty:
-    remote_only["rank_score"] = pd.Series(dtype=int)
-    remote_only["matched_keywords"] = pd.Series(dtype=str)
-else:
-    remote_only[["rank_score", "matched_keywords"]] = remote_only.apply(
-        lambda row: pd.Series(
-            calculate_rank_score(
-                row.get("title", ""),
-                row.get("description", ""),
-                RANK_KEYWORDS,
-                MAX_RANK_SCORE,
-            )
-        ),
-        axis=1,
-    )
+    # ── FIX: guard against empty DataFrame before apply() ──
+    if remote_only.empty:
+        remote_only["rank_score"] = pd.Series(dtype=int)
+        remote_only["matched_keywords"] = pd.Series(dtype=str)
+    else:
+        remote_only[["rank_score", "matched_keywords"]] = remote_only.apply(
+            lambda row: pd.Series(
+                calculate_rank_score(
+                    row.get("title", ""),
+                    row.get("description", ""),
+                    RANK_KEYWORDS,
+                    MAX_RANK_SCORE,
+                )
+            ),
+            axis=1,
+        )
+
     remote_only = remote_only[remote_only["rank_score"] >= 1].copy()
 
     sort_columns = ["rank_score"]
@@ -366,7 +363,7 @@ scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 async def lifespan(app: FastAPI):
     """
     Start APScheduler when app boots.
-    Scrape runs at 8:00 AM IST daily — n8n triggers at 8:45 AM IST.
+    Scrape runs at 9:07 AM IST daily — n8n triggers at 9:45 AM IST.
     """
     scheduler.add_job(
         run_scraper,
@@ -377,7 +374,7 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    print("[Scheduler] Started. Daily scrape scheduled at 8:00 AM IST.")
+    print("[Scheduler] Started. Daily scrape scheduled at 9:07 AM IST.")
     yield
     scheduler.shutdown()
     print("[Scheduler] Shut down.")
@@ -451,8 +448,8 @@ def scrape_csv():
 def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
-    Pre-populated every day at 8:00 AM IST by the scheduler.
-    Set your n8n trigger to 8:45 AM IST.
+    Pre-populated every day at 9:07 AM IST by the scheduler.
+    Set your n8n trigger to 9:45 AM IST.
     """
     try:
         df = read_latest_csv_from_supabase()
@@ -461,7 +458,7 @@ def scrape_csv_cached():
         if "not found" in error_msg.lower() or "404" in error_msg:
             raise HTTPException(
                 status_code=404,
-                detail="No cached CSV found yet. Scheduler runs at 8:00 AM IST. "
+                detail="No cached CSV found yet. Scheduler runs at 9:07 AM IST. "
                        "Or trigger manually via POST /scrape.",
             )
         raise HTTPException(status_code=500, detail=f"Storage read error: {error_msg}")
