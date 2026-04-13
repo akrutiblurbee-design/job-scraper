@@ -16,7 +16,7 @@ from jobspy import scrape_jobs
 
 PAST_DAYS = 7          # increased from 2 → catches more jobs
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 10   # increased from 5 → more raw results to filter from
+RESULTS_WANTED = 70   # increased from 5 → more raw results to filter from
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -375,8 +375,8 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         run_scraper,
         trigger="cron",
-        hour=9,
-        minute=55,
+        hour=10,
+        minute=11,
         id="daily_scrape",
         replace_existing=True,
     )
