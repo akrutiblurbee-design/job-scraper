@@ -14,9 +14,9 @@ from jobspy import scrape_jobs
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-PAST_DAYS = 2
+PAST_DAYS = 7          # increased from 2 → catches more jobs
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 5
+RESULTS_WANTED = 10   # increased from 5 → more raw results to filter from
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -263,21 +263,28 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
     else:
         combined["work_location"] = "Unknown"
 
+    # ── FIX: keep jobs with missing/unparseable date instead of dropping them ──
     if "date_posted" in combined.columns:
         cutoff = datetime.now(timezone.utc) - timedelta(days=PAST_DAYS)
         combined["date_posted_parsed"] = pd.to_datetime(
             combined["date_posted"], utc=True, errors="coerce"
         )
+        # Keep rows where date is within window OR date couldn't be parsed (NaT)
         combined = combined[
-            combined["date_posted_parsed"].notna()
-            & (combined["date_posted_parsed"] >= cutoff)
+            combined["date_posted_parsed"].isna()
+            | (combined["date_posted_parsed"] >= cutoff)
         ].copy()
     else:
-        combined = combined.iloc[0:0].copy()
+        # No date column — keep everything, add empty parsed column
+        combined["date_posted_parsed"] = pd.NaT
+
+    print(f"  [{category_label}] {len(combined)} jobs after date filter")
 
     remote_only = combined[combined["work_location"] == "Remote"].copy()
 
-    # ── FIX: guard against empty DataFrame before apply() ──
+    print(f"  [{category_label}] {len(remote_only)} remote jobs before ranking")
+
+    # ── guard against empty DataFrame before apply() ──
     if remote_only.empty:
         remote_only["rank_score"] = pd.Series(dtype=int)
         remote_only["matched_keywords"] = pd.Series(dtype=str)
@@ -363,18 +370,18 @@ scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 async def lifespan(app: FastAPI):
     """
     Start APScheduler when app boots.
-    Scrape runs at 9:07 AM IST daily — n8n triggers at 9:45 AM IST.
+    Scrape runs at 9:28 AM IST daily — n8n triggers at 10:00 AM IST.
     """
     scheduler.add_job(
         run_scraper,
         trigger="cron",
         hour=9,
-        minute=28,
+        minute=37,
         id="daily_scrape",
         replace_existing=True,
     )
     scheduler.start()
-    print("[Scheduler] Started. Daily scrape scheduled at 9:07 AM IST.")
+    print("[Scheduler] Started. Daily scrape scheduled at 9:28 AM IST.")
     yield
     scheduler.shutdown()
     print("[Scheduler] Shut down.")
@@ -385,7 +392,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
@@ -448,8 +455,8 @@ def scrape_csv():
 def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
-    Pre-populated every day at 9:07 AM IST by the scheduler.
-    Set your n8n trigger to 9:45 AM IST.
+    Pre-populated every day at 9:28 AM IST by the scheduler.
+    Set your n8n trigger to 10:00 AM IST.
     """
     try:
         df = read_latest_csv_from_supabase()
@@ -458,7 +465,7 @@ def scrape_csv_cached():
         if "not found" in error_msg.lower() or "404" in error_msg:
             raise HTTPException(
                 status_code=404,
-                detail="No cached CSV found yet. Scheduler runs at 9:07 AM IST. "
+                detail="No cached CSV found yet. Scheduler runs at 9:28 AM IST. "
                        "Or trigger manually via POST /scrape.",
             )
         raise HTTPException(status_code=500, detail=f"Storage read error: {error_msg}")
