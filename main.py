@@ -1,22 +1,20 @@
 from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
 import io
 import os
 import re
-  
+
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from supabase import create_client, Client
 from jobspy import scrape_jobs
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-PAST_DAYS = 7          # increased from 2 → catches more jobs
+PAST_DAYS = 7
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 70   # increased from 5 → more raw results to filter from
+RESULTS_WANTED = 70
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -26,8 +24,8 @@ MAX_RANK_SCORE = 10
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-SUPABASE_BUCKET = "Job-scraper"   # must match exactly (case-sensitive) in dashboard
-S3_PREFIX = "jobs"                # folder name inside the bucket — no trailing slash
+SUPABASE_BUCKET = "Job-scraper"
+S3_PREFIX = "jobs"
 FILE_RETENTION_DAYS = 3
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -136,10 +134,7 @@ def read_latest_csv_from_supabase() -> pd.DataFrame:
 
 
 def delete_old_files_from_supabase():
-    """
-    Delete dated CSV files older than FILE_RETENTION_DAYS.
-    Never deletes latest.csv.
-    """
+    """Delete dated CSV files older than FILE_RETENTION_DAYS. Never deletes latest.csv."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=FILE_RETENTION_DAYS)
 
     files = supabase.storage.from_(SUPABASE_BUCKET).list(S3_PREFIX)
@@ -263,28 +258,23 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
     else:
         combined["work_location"] = "Unknown"
 
-    # ── FIX: keep jobs with missing/unparseable date instead of dropping them ──
     if "date_posted" in combined.columns:
         cutoff = datetime.now(timezone.utc) - timedelta(days=PAST_DAYS)
         combined["date_posted_parsed"] = pd.to_datetime(
             combined["date_posted"], utc=True, errors="coerce"
         )
-        # Keep rows where date is within window OR date couldn't be parsed (NaT)
         combined = combined[
             combined["date_posted_parsed"].isna()
             | (combined["date_posted_parsed"] >= cutoff)
         ].copy()
     else:
-        # No date column — keep everything, add empty parsed column
         combined["date_posted_parsed"] = pd.NaT
 
     print(f"  [{category_label}] {len(combined)} jobs after date filter")
 
     remote_only = combined[combined["work_location"] == "Remote"].copy()
-
     print(f"  [{category_label}] {len(remote_only)} remote jobs before ranking")
 
-    # ── guard against empty DataFrame before apply() ──
     if remote_only.empty:
         remote_only["rank_score"] = pd.Series(dtype=int)
         remote_only["matched_keywords"] = pd.Series(dtype=str)
@@ -322,9 +312,7 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
 
 
 def run_scraper() -> pd.DataFrame:
-    """
-    Run all scraping categories, save to Supabase Storage, clean up old files.
-    """
+    """Run all scraping categories, save to Supabase Storage, clean up old files."""
     print(f"\n[{datetime.now()}] Starting scrape run...")
 
     print("\nScraping Web Dev jobs...")
@@ -361,53 +349,22 @@ def run_scraper() -> pd.DataFrame:
     return all_jobs
 
 
-# ─── Scheduler ────────────────────────────────────────────────────────────────
-
-scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Start APScheduler when app boots.
-    Scrape runs at 9:28 AM IST daily — n8n triggers at 10:00 AM IST.
-    """
-    scheduler.add_job(
-        run_scraper,
-        trigger="cron",
-        hour=7,
-        minute=11,
-        id="daily_scrape",
-        replace_existing=True,
-    )
-    scheduler.start()
-    print("[Scheduler] Started. Daily scrape scheduled at 9:28 AM IST.")
-    yield
-    scheduler.shutdown()
-    print("[Scheduler] Shut down.")
-
-
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="3.1.0",
-    lifespan=lifespan,
+    version="4.0.0",
 )
 
 
 @app.get("/", summary="Health check")
 def health_check():
-    """Health check — also shows next scheduled scrape time."""
-    next_run = None
-    job = scheduler.get_job("daily_scrape")
-    if job and job.next_run_time:
-        next_run = job.next_run_time.isoformat()
+    """Health check endpoint."""
     return {
         "status": "ok",
-        "message": "Job scraper is running",
-        "next_scheduled_scrape_IST": next_run,
+        "message": "Job scraper API is running",
+        "note": "Daily scrape is handled by Railway Cron (scraper.py) at 7:11 AM IST",
     }
 
 
@@ -455,8 +412,8 @@ def scrape_csv():
 def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
-    Pre-populated every day at 9:28 AM IST by the scheduler.
-    Set your n8n trigger to 10:00 AM IST.
+    Pre-populated every day at 7:11 AM IST by Railway Cron.
+    Set your n8n trigger to 8:00 AM IST (to give scraper time to finish).
     """
     try:
         df = read_latest_csv_from_supabase()
@@ -465,7 +422,7 @@ def scrape_csv_cached():
         if "not found" in error_msg.lower() or "404" in error_msg:
             raise HTTPException(
                 status_code=404,
-                detail="No cached CSV found yet. Scheduler runs at 9:28 AM IST. "
+                detail="No cached CSV found yet. Railway Cron runs scraper.py at 7:11 AM IST. "
                        "Or trigger manually via POST /scrape.",
             )
         raise HTTPException(status_code=500, detail=f"Storage read error: {error_msg}")
