@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import io
 import os
 import re
@@ -8,6 +9,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from supabase import create_client, Client
 from jobspy import scrape_jobs
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -19,6 +23,13 @@ SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
 MAX_RANK_SCORE = 10
+
+# ─── Scheduler Config ─────────────────────────────────────────────────────────
+
+# Set the time you want the scraper to run daily (IST = UTC+5:30)
+SCRAPE_HOUR_IST   = 10     # 7 AM IST
+SCRAPE_MINUTE_IST = 46   # 7:11 AM IST
+IST = ZoneInfo("Asia/Kolkata")
 
 # ─── Supabase Config ──────────────────────────────────────────────────────────
 
@@ -349,22 +360,99 @@ def run_scraper() -> pd.DataFrame:
     return all_jobs
 
 
+# ─── Scheduled Job Wrapper ────────────────────────────────────────────────────
+
+def scheduled_scrape():
+    """Wrapper called by APScheduler. Runs once daily at the configured IST time."""
+    print(f"\n[APScheduler] Triggered scheduled scrape at {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    try:
+        run_scraper()
+        print(f"[APScheduler] Scheduled scrape completed successfully.")
+    except Exception as e:
+        print(f"[APScheduler] Scheduled scrape FAILED: {e}")
+
+
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 
+# ─── Scheduler Startup / Shutdown ─────────────────────────────────────────────
+
+@app.on_event("startup")
+def start_scheduler():
+    scheduler = BackgroundScheduler(timezone=IST)
+    scheduler.add_job(
+        func=scheduled_scrape,
+        trigger=CronTrigger(
+            hour=SCRAPE_HOUR_IST,
+            minute=SCRAPE_MINUTE_IST,
+            timezone=IST,
+        ),
+        id="daily_scrape",
+        name="Daily LinkedIn Job Scrape",
+        replace_existing=True,   # Safe to redeploy without duplicate jobs
+        max_instances=1,         # Ensures it runs ONLY ONCE even if previous run is still going
+        coalesce=True,           # If missed fires on recovery, run only once
+    )
+    scheduler.start()
+    next_run = scheduler.get_job("daily_scrape").next_run_time
+    print(f"[APScheduler] Scheduler started. Next scrape at: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    # Store scheduler on app state so we can shut it down cleanly
+    app.state.scheduler = scheduler
+
+
+@app.on_event("shutdown")
+def stop_scheduler():
+    scheduler = getattr(app.state, "scheduler", None)
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+        print("[APScheduler] Scheduler shut down.")
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
 @app.get("/", summary="Health check")
 def health_check():
-    """Health check endpoint."""
+    """Health check endpoint. Also shows next scheduled scrape time."""
+    scheduler = getattr(app.state, "scheduler", None)
+    next_run = None
+    if scheduler:
+        job = scheduler.get_job("daily_scrape")
+        if job and job.next_run_time:
+            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
     return {
         "status": "ok",
         "message": "Job scraper API is running",
-        "note": "Daily scrape is handled by Railway Cron (scraper.py) at 7:11 AM IST",
+        "scheduler": "active" if scheduler and scheduler.running else "inactive",
+        "next_scheduled_scrape": next_run,
+    }
+
+
+@app.get("/scheduler/status", summary="Check scheduler status")
+def scheduler_status():
+    """Returns scheduler info and next scheduled run time."""
+    scheduler = getattr(app.state, "scheduler", None)
+    if not scheduler:
+        return {"running": False, "jobs": []}
+
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z") if job.next_run_time else None,
+        })
+
+    return {
+        "running": scheduler.running,
+        "jobs": jobs,
     }
 
 
@@ -412,7 +500,7 @@ def scrape_csv():
 def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
-    Pre-populated every day at 7:11 AM IST by Railway Cron.
+    Pre-populated every day at 7:11 AM IST by APScheduler.
     Set your n8n trigger to 8:00 AM IST (to give scraper time to finish).
     """
     try:
@@ -422,7 +510,7 @@ def scrape_csv_cached():
         if "not found" in error_msg.lower() or "404" in error_msg:
             raise HTTPException(
                 status_code=404,
-                detail="No cached CSV found yet. Railway Cron runs scraper.py at 7:11 AM IST. "
+                detail="No cached CSV found yet. APScheduler runs at 7:11 AM IST. "
                        "Or trigger manually via POST /scrape.",
             )
         raise HTTPException(status_code=500, detail=f"Storage read error: {error_msg}")
