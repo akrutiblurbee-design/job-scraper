@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 PAST_DAYS = 7
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 5
+RESULTS_WANTED = 70
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -27,8 +27,8 @@ MAX_RANK_SCORE = 10
 # ─── Scheduler Config ─────────────────────────────────────────────────────────
 
 # Set the time you want the scraper to run daily (IST = UTC+5:30)
-SCRAPE_HOUR_IST   = 10     # 7 AM IST
-SCRAPE_MINUTE_IST = 50  # 7:11 AM IST
+SCRAPE_HOUR_IST   = 7     # 7 AM IST
+SCRAPE_MINUTE_IST = 11  # 7:11 AM IST
 IST = ZoneInfo("Asia/Kolkata")
 
 # ─── Supabase Config ──────────────────────────────────────────────────────────
