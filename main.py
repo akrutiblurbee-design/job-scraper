@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 PAST_DAYS = 7
 HOURS_OLD = PAST_DAYS * 24
-RESULTS_WANTED = 70
+RESULTS_WANTED = 5
 SITE = ["linkedin"]
 JOB_TYPES = ["fulltime", "contract"]
 INCLUDE_RANK_SCORE = True
@@ -26,9 +26,12 @@ MAX_RANK_SCORE = 10
 
 # ─── Scheduler Config ─────────────────────────────────────────────────────────
 
-# Set the time you want the scraper to run daily (IST = UTC+5:30)
-SCRAPE_HOUR_IST   = 7     # 7 AM IST
-SCRAPE_MINUTE_IST = 11  # 7:11 AM IST
+SCRAPE_HOUR_IST   = 10
+SCRAPE_MINUTE_IST = 20   # Scrape runs at 7:11 AM IST
+
+SLACK_HOUR_IST    = 10
+SLACK_MINUTE_IST  = 35   # Slack delivery at 8:45 AM IST
+
 IST = ZoneInfo("Asia/Kolkata")
 
 # ─── Supabase Config ──────────────────────────────────────────────────────────
@@ -40,6 +43,11 @@ S3_PREFIX = "jobs"
 FILE_RETENTION_DAYS = 3
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# ─── Slack Config ─────────────────────────────────────────────────────────────
+
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")  # Add this in Railway Variables
+CACHED_CSV_URL = "https://job-scraper-production-3169.up.railway.app/scrape/csv/cached"
 
 # ─── Keywords & Search Terms ──────────────────────────────────────────────────
 
@@ -171,6 +179,99 @@ def delete_old_files_from_supabase():
         print(f"  Deleted {len(to_delete)} old file(s): {to_delete}")
     else:
         print("  No old files to delete.")
+
+
+# ─── Slack Notifier ───────────────────────────────────────────────────────────
+
+def send_csv_to_slack():
+    """
+    Fetches the cached CSV from Railway endpoint and sends a Slack notification
+    with job count summary and a direct download link.
+    Runs daily at 8:45 AM IST via APScheduler.
+    """
+    if not SLACK_WEBHOOK_URL:
+        print("[Slack] SLACK_WEBHOOK_URL is not set. Skipping Slack notification.")
+        return
+
+    try:
+        print(f"[Slack] Fetching CSV from {CACHED_CSV_URL} ...")
+
+        with httpx.Client(timeout=30) as client:
+            csv_response = client.get(CACHED_CSV_URL)
+            csv_response.raise_for_status()
+
+        csv_text = csv_response.text
+        lines = csv_text.strip().split("\n")
+        total_jobs = max(len(lines) - 1, 0)  # subtract header row
+
+        # Count by category if column exists
+        try:
+            df = pd.read_csv(io.StringIO(csv_text))
+            category_counts = {}
+            if "category" in df.columns:
+                category_counts = df["category"].value_counts().to_dict()
+        except Exception:
+            df = pd.DataFrame()
+            category_counts = {}
+
+        today = datetime.now(IST).strftime("%d %b %Y")
+
+        # Build category breakdown text
+        breakdown_lines = []
+        for cat, count in category_counts.items():
+            emoji = {"Web Dev": "💻", "AI": "🤖", "Mobile": "📱"}.get(cat, "📂")
+            breakdown_lines.append(f"{emoji} {cat}: *{count}* jobs")
+        breakdown_text = "\n".join(breakdown_lines) if breakdown_lines else "No breakdown available"
+
+        payload = {
+            "text": f"📊 *Daily Job Scrape Report — {today}*",
+            "attachments": [
+                {
+                    "color": "#36a64f",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*Total Remote Jobs Found:* `{total_jobs}`\n\n{breakdown_text}"
+                            }
+                        },
+                        {
+                            "type": "divider"
+                        },
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*⬇️ Download CSV:*\n<{CACHED_CSV_URL}|Click here to download today's job list>"
+                            }
+                        },
+                        {
+                            "type": "context",
+                            "elements": [
+                                {
+                                    "type": "mrkdwn",
+                                    "text": f"🕐 Scraped at 7:11 AM IST • Delivered at 8:45 AM IST • Job Scraper Bot on Railway"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+
+        with httpx.Client(timeout=15) as client:
+            slack_response = client.post(SLACK_WEBHOOK_URL, json=payload)
+            slack_response.raise_for_status()
+
+        print(f"[Slack] ✅ Notification sent successfully — {total_jobs} jobs reported.")
+
+    except httpx.HTTPStatusError as e:
+        print(f"[Slack] ❌ HTTP error: {e.response.status_code} — {e.response.text}")
+    except httpx.RequestError as e:
+        print(f"[Slack] ❌ Request failed: {e}")
+    except Exception as e:
+        print(f"[Slack] ❌ Unexpected error: {e}")
 
 
 # ─── Core Logic ───────────────────────────────────────────────────────────────
@@ -360,10 +461,10 @@ def run_scraper() -> pd.DataFrame:
     return all_jobs
 
 
-# ─── Scheduled Job Wrapper ────────────────────────────────────────────────────
+# ─── Scheduled Job Wrappers ───────────────────────────────────────────────────
 
 def scheduled_scrape():
-    """Wrapper called by APScheduler. Runs once daily at the configured IST time."""
+    """Wrapper called by APScheduler. Runs once daily at 7:11 AM IST."""
     print(f"\n[APScheduler] Triggered scheduled scrape at {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     try:
         run_scraper()
@@ -372,12 +473,22 @@ def scheduled_scrape():
         print(f"[APScheduler] Scheduled scrape FAILED: {e}")
 
 
+def scheduled_slack():
+    """Wrapper called by APScheduler. Runs once daily at 8:45 AM IST."""
+    print(f"\n[APScheduler] Triggered Slack delivery at {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    try:
+        send_csv_to_slack()
+        print(f"[APScheduler] Slack delivery completed successfully.")
+    except Exception as e:
+        print(f"[APScheduler] Slack delivery FAILED: {e}")
+
+
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Job Scraper API",
     description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 
@@ -386,6 +497,8 @@ app = FastAPI(
 @app.on_event("startup")
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone=IST)
+
+    # Job 1: Scrape at 7:11 AM IST
     scheduler.add_job(
         func=scheduled_scrape,
         trigger=CronTrigger(
@@ -395,15 +508,35 @@ def start_scheduler():
         ),
         id="daily_scrape",
         name="Daily LinkedIn Job Scrape",
-        replace_existing=True,   # Safe to redeploy without duplicate jobs
-        max_instances=1,         # Ensures it runs ONLY ONCE even if previous run is still going
-        coalesce=True,           # If missed fires on recovery, run only once
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
-    scheduler.start()
-    next_run = scheduler.get_job("daily_scrape").next_run_time
-    print(f"[APScheduler] Scheduler started. Next scrape at: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-    # Store scheduler on app state so we can shut it down cleanly
+    # Job 2: Send to Slack at 8:45 AM IST
+    scheduler.add_job(
+        func=scheduled_slack,
+        trigger=CronTrigger(
+            hour=SLACK_HOUR_IST,
+            minute=SLACK_MINUTE_IST,
+            timezone=IST,
+        ),
+        id="daily_slack",
+        name="Daily Slack CSV Delivery",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    scheduler.start()
+
+    scrape_job = scheduler.get_job("daily_scrape")
+    slack_job  = scheduler.get_job("daily_slack")
+
+    print(f"[APScheduler] Scheduler started.")
+    print(f"[APScheduler] Next scrape  : {scrape_job.next_run_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"[APScheduler] Next Slack   : {slack_job.next_run_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
     app.state.scheduler = scheduler
 
 
@@ -419,25 +552,31 @@ def stop_scheduler():
 
 @app.get("/", summary="Health check")
 def health_check():
-    """Health check endpoint. Also shows next scheduled scrape time."""
+    """Health check endpoint. Also shows next scheduled run times."""
     scheduler = getattr(app.state, "scheduler", None)
-    next_run = None
+    next_scrape = None
+    next_slack  = None
+
     if scheduler:
-        job = scheduler.get_job("daily_scrape")
-        if job and job.next_run_time:
-            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        scrape_job = scheduler.get_job("daily_scrape")
+        slack_job  = scheduler.get_job("daily_slack")
+        if scrape_job and scrape_job.next_run_time:
+            next_scrape = scrape_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        if slack_job and slack_job.next_run_time:
+            next_slack = slack_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
     return {
         "status": "ok",
         "message": "Job scraper API is running",
         "scheduler": "active" if scheduler and scheduler.running else "inactive",
-        "next_scheduled_scrape": next_run,
+        "next_scheduled_scrape": next_scrape,
+        "next_scheduled_slack":  next_slack,
     }
 
 
 @app.get("/scheduler/status", summary="Check scheduler status")
 def scheduler_status():
-    """Returns scheduler info and next scheduled run time."""
+    """Returns scheduler info and next scheduled run times."""
     scheduler = getattr(app.state, "scheduler", None)
     if not scheduler:
         return {"running": False, "jobs": []}
@@ -478,7 +617,7 @@ def scrape_json():
 def scrape_csv():
     """
     Manually trigger a full scrape and return as downloadable CSV.
-    WARNING: Takes ~15 min. Use /scrape/csv/cached for n8n.
+    WARNING: Takes ~15 min. Use /scrape/csv/cached for quick access.
     """
     try:
         df = run_scraper()
@@ -496,12 +635,11 @@ def scrape_csv():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/scrape/csv/cached", summary="← USE THIS IN n8n — returns latest CSV instantly")
+@app.get("/scrape/csv/cached", summary="Returns latest CSV instantly from Supabase")
 def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
     Pre-populated every day at 7:11 AM IST by APScheduler.
-    Set your n8n trigger to 8:00 AM IST (to give scraper time to finish).
     """
     try:
         df = read_latest_csv_from_supabase()
@@ -543,6 +681,19 @@ def list_csv_files():
                 for f in files
             ],
         })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/test/slack", summary="Manually trigger Slack notification for testing")
+def test_slack():
+    """
+    Manually triggers the Slack CSV delivery.
+    Use this to test your webhook before waiting for the 8:45 AM schedule.
+    """
+    try:
+        send_csv_to_slack()
+        return {"status": "ok", "message": "Slack notification triggered. Check your channel!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
