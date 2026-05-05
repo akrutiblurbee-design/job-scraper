@@ -46,7 +46,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ─── Slack Config ─────────────────────────────────────────────────────────────
 
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")  # Add this in Railway Variables
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 CACHED_CSV_URL = "https://job-scraper-production-3169.up.railway.app/scrape/csv/cached"
 
 # ─── Keywords & Search Terms ──────────────────────────────────────────────────
@@ -145,11 +145,18 @@ def save_csv_to_supabase(df: pd.DataFrame):
 
 
 def read_latest_csv_from_supabase() -> pd.DataFrame:
-    """Download jobs/latest.csv from Supabase Storage."""
-    response = supabase.storage.from_(SUPABASE_BUCKET).download(
-        f"{S3_PREFIX}/latest.csv"
-    )
-    return pd.read_csv(io.BytesIO(response))
+    """
+    Download jobs/latest.csv from Supabase Storage.
+    Returns an empty DataFrame if the file doesn't exist (e.g. first run).
+    """
+    try:
+        response = supabase.storage.from_(SUPABASE_BUCKET).download(
+            f"{S3_PREFIX}/latest.csv"
+        )
+        return pd.read_csv(io.BytesIO(response))
+    except Exception as e:
+        print(f"  [Dedup] Could not load previous latest.csv (first run?): {e}")
+        return pd.DataFrame()
 
 
 def delete_old_files_from_supabase():
@@ -233,7 +240,7 @@ def send_csv_to_slack():
                             "type": "section",
                             "text": {
                                 "type": "mrkdwn",
-                                "text": f"*Total Remote Jobs Found:* `{total_jobs}`\n\n{breakdown_text}"
+                                "text": f"*Total New Remote Jobs Found:* `{total_jobs}`\n\n{breakdown_text}"
                             }
                         },
                         {
@@ -423,8 +430,38 @@ def scrape_category(search_terms: list[str], category_label: str) -> pd.DataFram
     return result
 
 
+def deduplicate_against_previous(all_jobs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Loads the previous latest.csv from Supabase and removes any job_urls
+    that were already present in that file. Returns only net-new unique jobs.
+    Safe to call on first run — returns all_jobs unchanged if no previous file exists.
+    """
+    print("\nChecking for duplicates against previous scrape...")
+
+    previous_df = read_latest_csv_from_supabase()
+
+    if previous_df.empty:
+        print("  [Dedup] No previous file found — skipping dedup, all jobs are new.")
+        return all_jobs
+
+    if "job_url" not in previous_df.columns or "job_url" not in all_jobs.columns:
+        print("  [Dedup] job_url column missing — skipping dedup.")
+        return all_jobs
+
+    seen_urls = set(previous_df["job_url"].dropna().str.strip())
+    before_count = len(all_jobs)
+
+    all_jobs = all_jobs[~all_jobs["job_url"].str.strip().isin(seen_urls)].copy()
+    after_count = len(all_jobs)
+
+    removed = before_count - after_count
+    print(f"  [Dedup] {before_count} scraped → {after_count} unique new jobs ({removed} duplicates removed from last run)")
+
+    return all_jobs
+
+
 def run_scraper() -> pd.DataFrame:
-    """Run all scraping categories, save to Supabase Storage, clean up old files."""
+    """Run all scraping categories, deduplicate against previous output, save to Supabase Storage."""
     print(f"\n[{datetime.now()}] Starting scrape run...")
 
     print("\nScraping Web Dev jobs...")
@@ -438,10 +475,18 @@ def run_scraper() -> pd.DataFrame:
 
     all_jobs = pd.concat([web_dev_jobs, ai_jobs, mobile_jobs], ignore_index=True)
 
-    if not all_jobs.empty and "rank_score" in all_jobs.columns:
-        all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
+    # Deduplicate within this scrape run (same job_url across categories)
     if not all_jobs.empty and "job_url" in all_jobs.columns:
         all_jobs.drop_duplicates(subset=["job_url"], inplace=True)
+
+    if not all_jobs.empty and "rank_score" in all_jobs.columns:
+        all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
+
+    # ── Deduplicate against previous latest.csv from Supabase ─────────────────
+    all_jobs = deduplicate_against_previous(all_jobs)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Final sort after dedup
     if not all_jobs.empty and "rank_score" in all_jobs.columns:
         all_jobs.sort_values(by="rank_score", ascending=False, inplace=True)
 
@@ -455,7 +500,7 @@ def run_scraper() -> pd.DataFrame:
     print(f"Web Dev  : {len(web_dev_jobs)} remote jobs")
     print(f"AI       : {len(ai_jobs)} remote jobs")
     print(f"Mobile   : {len(mobile_jobs)} remote jobs")
-    print(f"Combined : {len(all_jobs)} remote jobs")
+    print(f"Combined : {len(all_jobs)} unique new remote jobs (after dedup)")
     print("Done!")
 
     return all_jobs
@@ -487,8 +532,8 @@ def scheduled_slack():
 
 app = FastAPI(
     title="Job Scraper API",
-    description="Scrapes LinkedIn remote jobs and returns ranked results.",
-    version="4.2.0",
+    description="Scrapes LinkedIn remote jobs and returns ranked, deduplicated results.",
+    version="4.3.0",
 )
 
 
@@ -597,7 +642,7 @@ def scheduler_status():
 
 @app.post("/scrape", summary="Manually trigger scraper → return JSON")
 def scrape_json():
-    """Manually trigger a full scrape. Saves to Supabase Storage and cleans old files."""
+    """Manually trigger a full scrape. Deduplicates against previous run, saves to Supabase."""
     try:
         df = run_scraper()
         df = df.where(pd.notnull(df), None)
@@ -640,9 +685,18 @@ def scrape_csv_cached():
     """
     Returns jobs/latest.csv from Supabase Storage. Responds in milliseconds.
     Pre-populated every day at 7:11 AM IST by APScheduler.
+    Contains only net-new unique jobs not seen in the previous scrape.
     """
     try:
         df = read_latest_csv_from_supabase()
+        if df.empty:
+            raise HTTPException(
+                status_code=404,
+                detail="No cached CSV found yet. APScheduler runs at 7:11 AM IST. "
+                       "Or trigger manually via POST /scrape.",
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         if "not found" in error_msg.lower() or "404" in error_msg:
