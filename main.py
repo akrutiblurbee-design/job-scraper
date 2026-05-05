@@ -26,11 +26,11 @@ MAX_RANK_SCORE = 10
 
 # ─── Scheduler Config ─────────────────────────────────────────────────────────
 
-SCRAPE_HOUR_IST   = 10
-SCRAPE_MINUTE_IST = 35   # Scrape runs at 7:11 AM IST
+SCRAPE_HOUR_IST   = 7
+SCRAPE_MINUTE_IST = 11   # Scrape runs at 7:11 AM IST
 
-SLACK_HOUR_IST    = 12
-SLACK_MINUTE_IST  = 10  # Slack delivery at 8:45 AM IST
+SLACK_HOUR_IST    = 8
+SLACK_MINUTE_IST  = 45  # Slack delivery at 8:45 AM IST
 
 IST = ZoneInfo("Asia/Kolkata")
 
